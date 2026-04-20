@@ -16,18 +16,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <linux/audit.h>
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
 #include <linux/seccomp.h>
 
 #define STACK_SZ	(1 << 20)
 #define NEW_ROOT	"/tmp/agent_root"
+
+static const char *agent_dir;	/* host path bind-mounted at /agent */
 
 #ifndef landlock_create_ruleset
 static inline int
@@ -125,6 +129,7 @@ setup_root(void)
 	mkdir(NEW_ROOT "/bin",	  0755);
 	mkdir(NEW_ROOT "/proc",	  0755);
 	mkdir(NEW_ROOT "/tmp",	  01777);
+	mkdir(NEW_ROOT "/agent",  0755);
 	mkdir(NEW_ROOT "/oldroot", 0755);
 
 	if (mount("/usr", NEW_ROOT "/usr", NULL,
@@ -141,6 +146,12 @@ setup_root(void)
 	if (mount("/bin", NEW_ROOT "/bin", NULL,
 		  MS_BIND | MS_REC | MS_RDONLY, NULL))
 		return -1;
+
+	if (mount(agent_dir, NEW_ROOT "/agent", NULL,
+		  MS_BIND | MS_REC | MS_RDONLY, NULL)) {
+		perror("mount agent");
+		return -1;
+	}
 
 	/*
 	 * Mount proc before pivot_root: kernel's mount_too_revealing check
@@ -193,6 +204,8 @@ apply_landlock(void)
 	    ll_allow(fd, "/lib",   LL_RX)  ||
 	    ll_allow(fd, "/lib64", LL_RX)  ||
 	    ll_allow(fd, "/bin",   LL_RX)  ||
+	    ll_allow(fd, "/agent", LL_RX)  ||
+	    ll_allow(fd, "/proc",  LL_RX)  ||
 	    ll_allow(fd, "/tmp",   LL_RWX)) {
 		close(fd);
 		return -1;
@@ -206,22 +219,44 @@ apply_landlock(void)
 	return 0;
 }
 
+/*
+ * Drop all capabilities. Mounts + pivot_root already done, so nothing
+ * after this needs caps. Kills CAP_NET_RAW → SOCK_RAW socket() → EPERM.
+ */
+static int
+drop_caps(void)
+{
+	struct __user_cap_header_struct hdr = {
+		.version = _LINUX_CAPABILITY_VERSION_3,
+		.pid	 = 0,
+	};
+	struct __user_cap_data_struct data[2] = { { 0 } };
+
+	return syscall(SYS_capset, &hdr, data);
+}
+
 static int
 apply_seccomp(void)
 {
+	/*
+	 * RET_ERRNO (not KILL): agent gets EPERM and can continue — demo
+	 * probe reports the block. Use KILL only for syscalls we never
+	 * want observed at all.
+	 */
+	#define DENY	(SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA))
 	struct sock_filter f[] = {
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
 			 offsetof(struct seccomp_data, nr)),
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mount,	 0, 1),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_RET | BPF_K, DENY),
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_umount2, 0, 1),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_RET | BPF_K, DENY),
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ptrace, 0, 1),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_RET | BPF_K, DENY),
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pivot_root, 0, 1),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_RET | BPF_K, DENY),
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_reboot, 0, 1),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_RET | BPF_K, DENY),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 	};
 	struct sock_fprog prog = {
@@ -253,6 +288,10 @@ child(void *arg)
 		perror("landlock");
 		_exit(1);
 	}
+	if (drop_caps()) {
+		perror("drop_caps");
+		_exit(1);
+	}
 	if (apply_seccomp()) {
 		perror("seccomp");
 		_exit(1);
@@ -269,12 +308,25 @@ main(int argc, char **argv)
 	struct args a;
 	int pipefd[2], status;
 	char path[64], map[64];
+	char agent_buf[PATH_MAX];
+	const char *env_agent;
 	pid_t pid;
 	void *stack;
 
 	if (argc < 2) {
 		fprintf(stderr, "usage: %s cmd [args...]\n", argv[0]);
 		return 1;
+	}
+
+	env_agent = getenv("AGENT_DIR");
+	if (env_agent) {
+		agent_dir = env_agent;
+	} else {
+		if (!realpath("./agent", agent_buf)) {
+			perror("realpath ./agent (set AGENT_DIR?)");
+			return 1;
+		}
+		agent_dir = agent_buf;
 	}
 
 	mkdir(NEW_ROOT, 0755);
