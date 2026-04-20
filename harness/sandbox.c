@@ -31,6 +31,22 @@
 #define STACK_SZ	(1 << 20)
 #define NEW_ROOT	"/tmp/agent_root"
 
+/*
+ * Progressive isolation profiles. Each level adds on top of the previous,
+ * so the demo probe shows strictly more BLOCKED rows as the profile rises.
+ *	none		no isolation; baseline.
+ *	ns_only		+ user/mnt/pid/net/ipc ns + pivot_root
+ *	landlock	+ landlock fs restrictions
+ *	full		+ drop caps + seccomp
+ */
+enum profile {
+	PROF_NONE,
+	PROF_NS,
+	PROF_LANDLOCK,
+	PROF_FULL,
+};
+
+static enum profile profile = PROF_FULL;
 static const char *agent_dir;	/* host path bind-mounted at /agent */
 
 #ifndef landlock_create_ruleset
@@ -280,21 +296,23 @@ child(void *arg)
 		_exit(1);
 	close(a->sync_fd);
 
-	if (setup_root()) {
+	if (profile >= PROF_NS && setup_root()) {
 		perror("setup_root");
 		_exit(1);
 	}
-	if (apply_landlock()) {
+	if (profile >= PROF_LANDLOCK && apply_landlock()) {
 		perror("landlock");
 		_exit(1);
 	}
-	if (drop_caps()) {
-		perror("drop_caps");
-		_exit(1);
-	}
-	if (apply_seccomp()) {
-		perror("seccomp");
-		_exit(1);
+	if (profile >= PROF_FULL) {
+		if (drop_caps()) {
+			perror("drop_caps");
+			_exit(1);
+		}
+		if (apply_seccomp()) {
+			perror("seccomp");
+			_exit(1);
+		}
 	}
 
 	execvp(a->argv[0], a->argv);
@@ -302,67 +320,98 @@ child(void *arg)
 	_exit(127);
 }
 
+static void
+usage(const char *prog)
+{
+	fprintf(stderr,
+		"usage: %s [--profile none|ns_only|landlock|full] "
+		"cmd [args...]\n", prog);
+}
+
+static int
+parse_profile(const char *s, enum profile *p)
+{
+	if (!strcmp(s, "none"))		*p = PROF_NONE;
+	else if (!strcmp(s, "ns_only"))	*p = PROF_NS;
+	else if (!strcmp(s, "landlock"))	*p = PROF_LANDLOCK;
+	else if (!strcmp(s, "full"))	*p = PROF_FULL;
+	else				return -1;
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	struct args a;
-	int pipefd[2], status;
+	int pipefd[2], status, argi = 1, flags = SIGCHLD;
 	char path[64], map[64];
 	char agent_buf[PATH_MAX];
 	const char *env_agent;
 	pid_t pid;
 	void *stack;
 
-	if (argc < 2) {
-		fprintf(stderr, "usage: %s cmd [args...]\n", argv[0]);
+	if (argi < argc && !strcmp(argv[argi], "--profile")) {
+		if (argi + 1 >= argc || parse_profile(argv[argi + 1],
+						      &profile)) {
+			usage(argv[0]);
+			return 1;
+		}
+		argi += 2;
+	}
+
+	if (argi >= argc) {
+		usage(argv[0]);
 		return 1;
 	}
 
-	env_agent = getenv("AGENT_DIR");
-	if (env_agent) {
-		agent_dir = env_agent;
-	} else {
-		if (!realpath("./agent", agent_buf)) {
-			perror("realpath ./agent (set AGENT_DIR?)");
-			return 1;
+	if (profile >= PROF_NS) {
+		env_agent = getenv("AGENT_DIR");
+		if (env_agent) {
+			agent_dir = env_agent;
+		} else {
+			if (!realpath("./agent", agent_buf)) {
+				perror("realpath ./agent (set AGENT_DIR?)");
+				return 1;
+			}
+			agent_dir = agent_buf;
 		}
-		agent_dir = agent_buf;
+		mkdir(NEW_ROOT, 0755);
+		flags |= CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID |
+			 CLONE_NEWNET  | CLONE_NEWIPC;
 	}
-
-	mkdir(NEW_ROOT, 0755);
 
 	if (pipe(pipefd))
 		return 1;
-	a.argv	  = argv + 1;
+	a.argv	  = argv + argi;
 	a.sync_fd = pipefd[0];
 
 	stack = malloc(STACK_SZ);
 	if (!stack)
 		return 1;
 
-	pid = clone(child, (char *)stack + STACK_SZ,
-		    CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID |
-		    CLONE_NEWNET  | CLONE_NEWIPC | SIGCHLD, &a);
+	pid = clone(child, (char *)stack + STACK_SZ, flags, &a);
 	if (pid < 0) {
 		perror("clone");
 		return 1;
 	}
 	close(pipefd[0]);
 
-	/* setgroups=deny must precede gid_map for unprivileged user ns */
-	snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
-	if (write_file(path, "deny"))
-		perror("setgroups");
+	if (profile >= PROF_NS) {
+		/* setgroups=deny must precede gid_map for unpriv userns */
+		snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
+		if (write_file(path, "deny"))
+			perror("setgroups");
 
-	snprintf(map,  sizeof(map),  "0 %d 1", getuid());
-	snprintf(path, sizeof(path), "/proc/%d/uid_map", pid);
-	if (write_file(path, map))
-		perror("uid_map");
+		snprintf(map,  sizeof(map),  "0 %d 1", getuid());
+		snprintf(path, sizeof(path), "/proc/%d/uid_map", pid);
+		if (write_file(path, map))
+			perror("uid_map");
 
-	snprintf(map,  sizeof(map),  "0 %d 1", getgid());
-	snprintf(path, sizeof(path), "/proc/%d/gid_map", pid);
-	if (write_file(path, map))
-		perror("gid_map");
+		snprintf(map,  sizeof(map),  "0 %d 1", getgid());
+		snprintf(path, sizeof(path), "/proc/%d/gid_map", pid);
+		if (write_file(path, map))
+			perror("gid_map");
+	}
 
 	/* release child */
 	if (write(pipefd[1], "x", 1) != 1)

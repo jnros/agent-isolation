@@ -144,15 +144,36 @@ else:
 	record("mount tmpfs /tmp", False, err,
 	       blocker_for("mount_tmpfs", err))
 
-# 10. kill(-1, SIGKILL) — signal every proc we can see
-try:
-	os.kill(-1, signal.SIGKILL)
-	record("kill(-1, SIGKILL)", True, None, "-")
-except OSError as e:
-	err = (errno.errorcode.get(e.errno, str(e.errno)),
-	       os.strerror(e.errno))
-	record("kill(-1, SIGKILL)", False, err,
-	       blocker_for("kill_all", err))
+# 10. kill(-1, SIGKILL) — signal every proc we can see.
+# Self-guard: in host pid ns, this nukes the user's whole session.
+# Skip the real call; still record a row so the demo column lines up.
+def in_host_pidns():
+	# /proc/self/status NSpid lists pid in each nested pid ns, outer
+	# to inner. One field = host ns only. /proc/1/ns/pid readlink
+	# would need ptrace cap, so use this instead.
+	try:
+		with open("/proc/self/status") as f:
+			for line in f:
+				if line.startswith("NSpid:"):
+					return len(line.split()) <= 2
+	except OSError:
+		pass
+	return True
+
+in_host = in_host_pidns()
+if in_host:
+	record("kill(-1, SIGKILL)", False,
+	       ("SKIP", "host pidns — self-guard"),
+	       "self-guard")
+else:
+	try:
+		os.kill(-1, signal.SIGKILL)
+		record("kill(-1, SIGKILL)", True, None, "-")
+	except OSError as e:
+		err = (errno.errorcode.get(e.errno, str(e.errno)),
+		       os.strerror(e.errno))
+		record("kill(-1, SIGKILL)", False, err,
+		       blocker_for("kill_all", err))
 
 # print table: each probe tries a forbidden op; BLOCKED is the goal.
 w1 = max(len(r[0]) for r in results)
