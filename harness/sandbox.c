@@ -1,11 +1,9 @@
 /*
  * sandbox: unprivileged agent isolation via namespaces + landlock + seccomp.
  *
- * pivot_root vs chroot: pivot_root swaps the mount's root and requires new
- * root to be a mountpoint; old root is detached so the child cannot escape
- * via ../.. or open fds. chroot only changes the path resolution root and
- * a process with CAP_SYS_CHROOT (or open fd to old root) can break out.
- * We use pivot_root; fallback to chroot only if pivot_root fails.
+ * pivot_root (not chroot): swaps mount's root and detaches the old root so
+ * child can't escape via ../.. or lingering fds. chroot is bypassable by
+ * a proc with CAP_SYS_CHROOT or an open fd to old root.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -49,31 +47,7 @@ enum profile {
 static enum profile profile = PROF_FULL;
 static const char *agent_dir;	/* host path bind-mounted at /agent */
 
-#ifndef landlock_create_ruleset
-static inline int
-landlock_create_ruleset(const struct landlock_ruleset_attr *a,
-			size_t sz, __u32 flags)
-{
-	return syscall(__NR_landlock_create_ruleset, a, sz, flags);
-}
-#endif
-
-#ifndef landlock_restrict_self
-static inline int
-landlock_restrict_self(int fd, __u32 flags)
-{
-	return syscall(__NR_landlock_restrict_self, fd, flags);
-}
-#endif
-
-#ifndef landlock_add_rule
-static inline int
-landlock_add_rule(int fd, enum landlock_rule_type t,
-		  const void *attr, __u32 flags)
-{
-	return syscall(__NR_landlock_add_rule, fd, t, attr, flags);
-}
-#endif
+/* glibc doesn't wrap the landlock syscalls — call them directly. */
 
 #define LL_RX	(LANDLOCK_ACCESS_FS_EXECUTE   | \
 		 LANDLOCK_ACCESS_FS_READ_FILE | \
@@ -96,7 +70,8 @@ ll_allow(int rs, const char *path, __u64 access)
 	if (fd < 0)
 		return 0;	/* path absent in sandbox root — skip */
 	pb.parent_fd = fd;
-	rc = landlock_add_rule(rs, LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
+	rc = syscall(__NR_landlock_add_rule, rs,
+		     LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
 	close(fd);
 	return rc;
 }
@@ -120,48 +95,43 @@ write_file(const char *path, const char *data)
 }
 
 static int
-do_pivot_root(const char *new_root, const char *put_old)
-{
-	return syscall(SYS_pivot_root, new_root, put_old);
-}
-
-static int
 setup_root(void)
 {
+	static const struct bind {
+		const char	*src;
+		int		 optional;
+	} binds[] = {
+		{ "/usr",   0 },
+		{ "/lib",   0 },
+		{ "/lib64", 1 },
+		{ "/bin",   0 },
+	};
+	char dst[PATH_MAX];
+	size_t i;
+
 	/* make host mount propagation private so our mounts don't leak */
 	if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL)) {
 		perror("mount / private");
 		return -1;
 	}
-
 	if (mount("tmpfs", NEW_ROOT, "tmpfs", 0, "size=64m")) {
 		perror("mount tmpfs");
 		return -1;
 	}
 
-	mkdir(NEW_ROOT "/usr",	  0755);
-	mkdir(NEW_ROOT "/lib",	  0755);
-	mkdir(NEW_ROOT "/lib64",  0755);
-	mkdir(NEW_ROOT "/bin",	  0755);
-	mkdir(NEW_ROOT "/proc",	  0755);
-	mkdir(NEW_ROOT "/tmp",	  01777);
-	mkdir(NEW_ROOT "/agent",  0755);
+	mkdir(NEW_ROOT "/proc",	   0755);
+	mkdir(NEW_ROOT "/tmp",	   01777);
+	mkdir(NEW_ROOT "/agent",   0755);
 	mkdir(NEW_ROOT "/oldroot", 0755);
 
-	if (mount("/usr", NEW_ROOT "/usr", NULL,
-		  MS_BIND | MS_REC | MS_RDONLY, NULL))
-		return -1;
-
-	if (mount("/lib", NEW_ROOT "/lib", NULL,
-		  MS_BIND | MS_REC | MS_RDONLY, NULL))
-		return -1;
-
-	mount("/lib64", NEW_ROOT "/lib64", NULL,
-	      MS_BIND | MS_REC | MS_RDONLY, NULL);
-
-	if (mount("/bin", NEW_ROOT "/bin", NULL,
-		  MS_BIND | MS_REC | MS_RDONLY, NULL))
-		return -1;
+	for (i = 0; i < sizeof(binds) / sizeof(binds[0]); i++) {
+		snprintf(dst, sizeof(dst), "%s%s", NEW_ROOT, binds[i].src);
+		mkdir(dst, 0755);
+		if (mount(binds[i].src, dst, NULL,
+			  MS_BIND | MS_REC | MS_RDONLY, NULL) &&
+		    !binds[i].optional)
+			return -1;
+	}
 
 	if (mount(agent_dir, NEW_ROOT "/agent", NULL,
 		  MS_BIND | MS_REC | MS_RDONLY, NULL)) {
@@ -179,19 +149,15 @@ setup_root(void)
 		return -1;
 	}
 
-	if (do_pivot_root(NEW_ROOT, NEW_ROOT "/oldroot")) {
-		/* fallback: chroot is weaker, see file header */
-		if (chroot(NEW_ROOT))
-			return -1;
-		if (chdir("/"))
-			return -1;
-	} else {
-		if (chdir("/"))
-			return -1;
-		if (umount2("/oldroot", MNT_DETACH))
-			return -1;
-		rmdir("/oldroot");
+	if (syscall(SYS_pivot_root, NEW_ROOT, NEW_ROOT "/oldroot")) {
+		perror("pivot_root");
+		return -1;
 	}
+	if (chdir("/"))
+		return -1;
+	if (umount2("/oldroot", MNT_DETACH))
+		return -1;
+	rmdir("/oldroot");
 
 	return 0;
 }
@@ -212,7 +178,7 @@ apply_landlock(void)
 	};
 	int fd;
 
-	fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+	fd = syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
 	if (fd < 0)
 		return -1;
 
@@ -229,7 +195,7 @@ apply_landlock(void)
 
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
 		return -1;
-	if (landlock_restrict_self(fd, 0))
+	if (syscall(__NR_landlock_restrict_self, fd, 0))
 		return -1;
 	close(fd);
 	return 0;

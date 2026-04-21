@@ -13,144 +13,100 @@ libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 PTRACE_TRACEME	= 0
 
-results = []
+PROFILE		= os.environ.get("SANDBOX_PROFILE", "full")
+HAS_LANDLOCK	= PROFILE in ("landlock", "full")
+HAS_SECCOMP	= PROFILE == "full"
 
 
-def record(name, ok, err, blocker):
-	results.append((name, ok, err, blocker))
+def errtup(e):
+	code = e.errno
+	if code is None:
+		return ("?", str(e))
+	return (errno.errorcode.get(code, str(code)), os.strerror(code))
 
 
-def get_errno():
-	e = ctypes.get_errno()
-	return errno.errorcode.get(e, str(e)), os.strerror(e)
-
-
-def try_read(path):
-	try:
-		with open(path, "rb") as f:
-			f.read(64)
-		return True, None
-	except OSError as e:
-		return False, (errno.errorcode.get(e.errno, str(e.errno)),
-			       os.strerror(e.errno))
-
-
-def try_write(path):
-	try:
-		with open(path, "wb") as f:
-			f.write(b"x")
-		return True, None
-	except OSError as e:
-		return False, (errno.errorcode.get(e.errno, str(e.errno)),
-			       os.strerror(e.errno))
-
-
-def blocker_for(name, err):
+def blocker_for(key, err):
 	if err is None:
 		return "-"
 	code = err[0]
 	if code == "EPERM":
+		if key == "mount_tmpfs":
+			return ("seccomp" if HAS_SECCOMP
+				else "landlock" if HAS_LANDLOCK
+				else "caps")
+		if key == "ptrace_traceme":
+			return "seccomp" if HAS_SECCOMP else "caps/lsm"
 		return {
-			"ptrace_traceme":	"seccomp",
-			"unshare_newuser":	"userns/caps",
-			"mount_tmpfs":		"caps/landlock",
-			"kill_all":		"pidns/caps",
-			"socket_raw":		"caps",
-		}.get(name, "caps/lsm")
+			"kill_all":	"pidns/caps",
+			"socket_raw":	"caps",
+			"open_mem":	"caps",
+		}.get(key, "caps/lsm")
 	if code == "EACCES":
-		return "landlock/DAC"
+		return "landlock" if HAS_LANDLOCK else "DAC"
 	if code == "ENOENT":
-		if name == "read_proc2":
+		if key == "read_proc2":
 			return "pid ns"
 		return "mnt ns (not present)"
-	if code == "EROFS":
-		return "ro mount"
-	if code == "EAFNOSUPPORT" or code == "ENETUNREACH":
+	if code in ("EAFNOSUPPORT", "ENETUNREACH"):
 		return "net ns"
 	if code == "ENOSYS":
 		return "seccomp"
+	if code == "ESRCH" and key == "kill_all":
+		return "pid ns (no other procs)"
 	return code
 
 
-# 1. read /etc/passwd
-ok, err = try_read("/etc/passwd")
-record("read /etc/passwd", ok, err, blocker_for("read_passwd", err))
+def libc_call(fn, *args):
+	ctypes.set_errno(0)
+	if fn(*args) != 0:
+		e = ctypes.get_errno()
+		raise OSError(e, os.strerror(e))
 
-# 2. read /etc/shadow
-ok, err = try_read("/etc/shadow")
-record("read /etc/shadow", ok, err, blocker_for("read_shadow", err))
 
-# 3. read /proc/2/status — in pidns only PID 1 (self) exists
-ok, err = try_read("/proc/2/status")
-record("read /proc/2/status", ok, err, blocker_for("read_proc2", err))
+def op_read(p):
+	with open(p, "rb") as f:
+		f.read(64)
 
-# 4. write /evil (outside landlock-writable dirs)
-ok, err = try_write("/evil")
-record("write /evil", ok, err, blocker_for("write_evil", err))
 
-# 5. open /dev/sda raw
-try:
-	fd = os.open("/dev/sda", os.O_RDONLY)
-	os.close(fd)
-	record("open /dev/sda", True, None, "-")
-except OSError as e:
-	err = (errno.errorcode.get(e.errno, str(e.errno)),
-	       os.strerror(e.errno))
-	record("open /dev/sda", False, err, blocker_for("open_sda", err))
+def op_write(p):
+	with open(p, "wb") as f:
+		f.write(b"x")
 
-# 6. raw ICMP socket
-try:
-	s = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-			  socket.IPPROTO_ICMP)
-	s.close()
-	record("socket RAW ICMP", True, None, "-")
-except OSError as e:
-	err = (errno.errorcode.get(e.errno, str(e.errno)),
-	       os.strerror(e.errno))
-	record("socket RAW ICMP", False, err, blocker_for("socket_raw", err))
 
-# 7. TCP connect 8.8.8.8:53
-try:
+def op_open(p):
+	os.close(os.open(p, os.O_RDONLY))
+
+
+def op_sock_raw():
+	socket.socket(socket.AF_INET, socket.SOCK_RAW,
+		      socket.IPPROTO_ICMP).close()
+
+
+def op_connect():
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
 	s.settimeout(2)
-	s.connect(("8.8.8.8", 53))
-	s.close()
-	record("connect 8.8.8.8:53", True, None, "-")
-except OSError as e:
-	code = errno.errorcode.get(e.errno, str(e.errno)) if e.errno \
-		else "ETIMEDOUT?"
-	msg = os.strerror(e.errno) if e.errno else str(e)
-	err = (code, msg)
-	record("connect 8.8.8.8:53", False, err,
-	       blocker_for("connect", err))
+	try:
+		s.connect(("8.8.8.8", 53))
+	finally:
+		s.close()
 
-# 8. ptrace(PTRACE_TRACEME)
-ctypes.set_errno(0)
-r = libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
-if r == 0:
-	record("ptrace TRACEME", True, None, "-")
-else:
-	err = get_errno()
-	record("ptrace TRACEME", False, err,
-	       blocker_for("ptrace_traceme", err))
 
-# 9. mount tmpfs on /tmp
-ctypes.set_errno(0)
-r = libc.mount(b"tmpfs", b"/tmp", b"tmpfs", 0, None)
-if r == 0:
-	record("mount tmpfs /tmp", True, None, "-")
-else:
-	err = get_errno()
-	record("mount tmpfs /tmp", False, err,
-	       blocker_for("mount_tmpfs", err))
+def op_ptrace():
+	libc_call(libc.ptrace, PTRACE_TRACEME, 0, 0, 0)
 
-# 10. kill(-1, SIGKILL) — signal every proc we can see.
-# Self-guard: in host pid ns, this nukes the user's whole session.
-# Skip the real call; still record a row so the demo column lines up.
+
+def op_mount():
+	libc_call(libc.mount, b"tmpfs", b"/tmp", b"tmpfs", 0, None)
+
+
+def op_kill_all():
+	os.kill(-1, signal.SIGKILL)
+
+
 def in_host_pidns():
-	# /proc/self/status NSpid lists pid in each nested pid ns, outer
-	# to inner. One field = host ns only. /proc/1/ns/pid readlink
-	# would need ptrace cap, so use this instead.
+	# /proc/self/status NSpid lists pid in each nested pid ns, outer to
+	# inner. One field = host ns only. /proc/1/ns/pid readlink would
+	# need ptrace cap, so use this instead.
 	try:
 		with open("/proc/self/status") as f:
 			for line in f:
@@ -160,20 +116,46 @@ def in_host_pidns():
 		pass
 	return True
 
-in_host = in_host_pidns()
-if in_host:
-	record("kill(-1, SIGKILL)", False,
-	       ("SKIP", "host pidns — self-guard"),
-	       "self-guard")
+
+PROBES = [
+	("read /etc/passwd",	lambda: op_read("/etc/passwd"),		"read_passwd"),
+	("read /etc/shadow",	lambda: op_read("/etc/shadow"),		"read_shadow"),
+	# /proc/2/status — in pidns only PID 1 (self) exists
+	("read /proc/2/status",	lambda: op_read("/proc/2/status"),	"read_proc2"),
+	# write outside landlock-writable dirs
+	("write /evil",		lambda: op_write("/evil"),		"write_evil"),
+	# /dev/mem — CAP_SYS_RAWIO + DAC (root:kmem 0640) both gate
+	("open /dev/mem",	lambda: op_open("/dev/mem"),		"open_mem"),
+	("socket RAW ICMP",	op_sock_raw,				"socket_raw"),
+	("connect 8.8.8.8:53",	op_connect,				"connect"),
+	("ptrace TRACEME",	op_ptrace,				"ptrace_traceme"),
+	("mount tmpfs /tmp",	op_mount,				"mount_tmpfs"),
+]
+
+results = []
+
+for name, fn, key in PROBES:
+	try:
+		fn()
+		results.append((name, True, None, "-"))
+	except OSError as e:
+		err = errtup(e)
+		results.append((name, False, err, blocker_for(key, err)))
+
+# kill(-1, SIGKILL) — signal every proc we can see.
+# Self-guard: in host pidns, this nukes the user's whole session.
+# full profile guarantees nested pidns; skip self-guard there.
+if PROFILE != "full" and in_host_pidns():
+	results.append(("kill(-1, SIGKILL)", False,
+			("SKIP", "host pidns — self-guard"), "self-guard"))
 else:
 	try:
-		os.kill(-1, signal.SIGKILL)
-		record("kill(-1, SIGKILL)", True, None, "-")
+		op_kill_all()
+		results.append(("kill(-1, SIGKILL)", True, None, "-"))
 	except OSError as e:
-		err = (errno.errorcode.get(e.errno, str(e.errno)),
-		       os.strerror(e.errno))
-		record("kill(-1, SIGKILL)", False, err,
-		       blocker_for("kill_all", err))
+		err = errtup(e)
+		results.append(("kill(-1, SIGKILL)", False, err,
+				blocker_for("kill_all", err)))
 
 # print table: each probe tries a forbidden op; BLOCKED is the goal.
 w1 = max(len(r[0]) for r in results)
@@ -181,9 +163,7 @@ print(f"{'op'.ljust(w1)}  {'result':<8}  {'errno':<16}  blocker")
 print("-" * (w1 + 2 + 8 + 2 + 16 + 2 + 20))
 for name, ok, err, blk in results:
 	status = "ALLOWED" if ok else "BLOCKED"
-	ecode = err[0] if err else "-"
-	emsg = err[1] if err else ""
-	cell = f"{ecode} ({emsg})" if err else "-"
+	cell = f"{err[0]} ({err[1]})" if err else "-"
 	print(f"{name.ljust(w1)}  {status:<8}  {cell:<16}  {blk}")
 
 sys.exit(0)

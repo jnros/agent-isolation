@@ -2,14 +2,14 @@
 op                   result    errno             blocker
 ---------------------------------------------------------------------
 read /etc/passwd     ALLOWED   -                 -
-read /etc/shadow     BLOCKED   EACCES (Permission denied)  landlock/DAC
+read /etc/shadow     BLOCKED   EACCES (Permission denied)  DAC
 read /proc/2/status  ALLOWED   -                 -
-write /evil          BLOCKED   EACCES (Permission denied)  landlock/DAC
-open /dev/sda        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
+write /evil          BLOCKED   EACCES (Permission denied)  DAC
+open /dev/mem        BLOCKED   EACCES (Permission denied)  DAC
 socket RAW ICMP      BLOCKED   EPERM (Operation not permitted)  caps
 connect 8.8.8.8:53   ALLOWED   -                 -
 ptrace TRACEME       ALLOWED   -                 -
-mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  caps/landlock
+mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  caps
 kill(-1, SIGKILL)    BLOCKED   SKIP (host pidns — self-guard)  self-guard
 
 === profile: ns_only ===
@@ -19,7 +19,7 @@ read /etc/passwd     BLOCKED   ENOENT (No such file or directory)  mnt ns (not p
 read /etc/shadow     BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 read /proc/2/status  BLOCKED   ENOENT (No such file or directory)  pid ns
 write /evil          ALLOWED   -                 -
-open /dev/sda        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
+open /dev/mem        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 socket RAW ICMP      ALLOWED   -                 -
 connect 8.8.8.8:53   BLOCKED   ENETUNREACH (Network is unreachable)  net ns
 ptrace TRACEME       ALLOWED   -                 -
@@ -32,12 +32,12 @@ op                   result    errno             blocker
 read /etc/passwd     BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 read /etc/shadow     BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 read /proc/2/status  BLOCKED   ENOENT (No such file or directory)  pid ns
-write /evil          BLOCKED   EACCES (Permission denied)  landlock/DAC
-open /dev/sda        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
+write /evil          BLOCKED   EACCES (Permission denied)  landlock
+open /dev/mem        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 socket RAW ICMP      ALLOWED   -                 -
 connect 8.8.8.8:53   BLOCKED   ENETUNREACH (Network is unreachable)  net ns
 ptrace TRACEME       ALLOWED   -                 -
-mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  caps/landlock
+mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  landlock
 kill(-1, SIGKILL)    BLOCKED   SKIP (host pidns — self-guard)  self-guard
 
 === profile: full ===
@@ -46,11 +46,11 @@ op                   result    errno             blocker
 read /etc/passwd     BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 read /etc/shadow     BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 read /proc/2/status  BLOCKED   ENOENT (No such file or directory)  pid ns
-write /evil          BLOCKED   EACCES (Permission denied)  landlock/DAC
-open /dev/sda        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
+write /evil          BLOCKED   EACCES (Permission denied)  landlock
+open /dev/mem        BLOCKED   ENOENT (No such file or directory)  mnt ns (not present)
 socket RAW ICMP      BLOCKED   EPERM (Operation not permitted)  caps
 connect 8.8.8.8:53   BLOCKED   ENETUNREACH (Network is unreachable)  net ns
 ptrace TRACEME       BLOCKED   EPERM (Operation not permitted)  seccomp
-mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  caps/landlock
-kill(-1, SIGKILL)    BLOCKED   SKIP (host pidns — self-guard)  self-guard
+mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  seccomp
+kill(-1, SIGKILL)    BLOCKED   ESRCH (No such process)  pid ns (no other procs)
 
