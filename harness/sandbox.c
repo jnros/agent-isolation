@@ -20,7 +20,6 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
-#include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
