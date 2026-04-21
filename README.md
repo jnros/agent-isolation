@@ -13,6 +13,7 @@ Sandbox harness and probe that isolate an untrusted agent. Four progressive prof
 
 ## Results: Isolation Matrix
 
+```
 === profile: none ===
 op                   result    errno             blocker
 ---------------------------------------------------------------------
@@ -68,15 +69,17 @@ connect 8.8.8.8:53   BLOCKED   ENETUNREACH (Network is unreachable)  net ns
 ptrace TRACEME       BLOCKED   EPERM (Operation not permitted)  seccomp
 mount tmpfs /tmp     BLOCKED   EPERM (Operation not permitted)  seccomp
 kill(-1, SIGKILL)    BLOCKED   ESRCH (No such process)  pid ns (no other procs)
+```
 
 ## Overhead
-
+```
 profile        startup_ms   ns_per_syscall   delta
 ---------------------------------------------------
 none                0.585             81.5      —
 ns_only             1.101             81.5      +0
 landlock            1.119             80.2      +0
 full                1.151             97.4     +16   (seccomp BPF)
+```
 
 ## Limitations
 Linux kernel remains in the trust boundary. Workloads with more strict requirements need user-space syscall interception (gVisor), per-agent VMs (Firecracker), or a microkernel (seL4). 
